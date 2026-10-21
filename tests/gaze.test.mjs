@@ -98,3 +98,13 @@ test('errorStats reports pixels and percent of the screen diagonal', () => {
   assert.ok(Math.abs(st.meanPx - 100) < 1e-9);
   assert.ok(Math.abs(st.pctDiag - 100 * 100 / Math.hypot(1000, 1000)) < 1e-9);
 });
+
+test('EyeClosure: looking down is not a blink, a real blink is', async () => {
+  const { EyeClosure } = await import('../js/gaze.js');
+  const gate = new EyeClosure();
+  for (let k = 0; k < 30; k++) gate.closed({ minOpen: 0.30, blink: 0.1 });
+  assert.equal(gate.closed({ minOpen: 0.20, blink: 0.6 }), false, 'looking down: lids narrower, blendshape 0.6');
+  assert.equal(gate.closed({ minOpen: 0.05, blink: 0.7 }), true, 'lids almost shut');
+  assert.equal(gate.closed({ minOpen: 0.28, blink: 0.9 }), true, 'blendshape very high');
+  assert.equal(new EyeClosure().closed({ minOpen: 0.3, blink: 0.5 }), false, 'no history yet: only the blendshape decides');
+});

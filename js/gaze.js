@@ -210,3 +210,20 @@ export function errorStats(points, W, H) {
   const meanPx = per.reduce((s, p) => s + p.errPx, 0) / per.length;
   return { meanPx, pctDiag: 100 * meanPx / Math.hypot(W, H), perPoint: per };
 }
+
+// ---------------------------------------------------------------- closed eyes
+
+// A frame counts as "eyes closed" when the lid gap falls below half of this person's usual gap (75th percentile of
+// the last ~3 s), or the blink blendshape is very high. A fixed blendshape cut-off (0.45) threw away most frames on a
+// phone held low: looking down narrows the lids and raises eyeBlink although the eyes are open (real phone, 2026-10-21).
+export class EyeClosure {
+  constructor(window = 90, ratio = 0.5, blendCut = 0.85) { Object.assign(this, { window, ratio, blendCut }); this.hist = []; }
+  closed(f) {
+    if (!f) return true;
+    const ref = this.hist.length >= 15 ? [...this.hist].sort((a, b) => a - b)[Math.floor(this.hist.length * 0.75)] : null;
+    const shut = f.blink > this.blendCut || (ref !== null && f.minOpen < this.ratio * ref);
+    this.hist.push(f.minOpen);
+    if (this.hist.length > this.window) this.hist.shift();
+    return shut;
+  }
+}

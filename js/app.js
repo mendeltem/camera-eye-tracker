@@ -1,15 +1,19 @@
 // Camera Eye Tracker: front camera -> MediaPipe Face Landmarker -> eye features -> ridge regression -> screen point.
 // Everything runs in the browser; no frame leaves the device.
 import { FaceLandmarker, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs';
-import { extractFeatures, GazeModel, OneEuro2D, cleanSamples, errorStats, calibrationPoints, validationPoints } from './gaze.js';
+import { extractFeatures, GazeModel, OneEuro2D, EyeClosure, cleanSamples, errorStats, calibrationPoints, validationPoints } from './gaze.js?v=2';
 
 const MEDIAPIPE_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 const TEST = new URLSearchParams(location.search).has('test');   // short timings for tests/browser_smoke.mjs
-const TIME = TEST ? { intro: 200, count: 100, settle: 150, collect: 350, tap: 250 }
-                  : { intro: 1800, count: 500, settle: 700, collect: 1000, tap: 500 };
-const MIN_SAMPLES = TEST ? 3 : 8;
-const BLINK = 0.45;                   // MediaPipe eyeBlink blendshape above this: skip the frame
+// per dot: wait `settle` for the eyes to land, collect at least `collect`, keep going up to `maxCollect` until
+// `want` frames are in (slow phones), accept the dot with `minSamples` (real phone 2026-10-21: 8 in 1 s failed at 6 fps)
+const TIME = TEST ? { intro: 200, count: 100, settle: 150, collect: 350, maxCollect: 700, tap: 250 }
+                  : { intro: 1800, count: 500, settle: 700, collect: 1000, maxCollect: 2500, tap: 500 };
+const WANT_SAMPLES = TEST ? 6 : 12;
+const MIN_SAMPLES = TEST ? 3 : 4;
+const MIN_DOTS = 5;                   // of 9 calibration dots
+const closure = new EyeClosure();
 const DWELL_MS = 1100;
 const MAX_TAPS = 12;                  // tap corrections kept in the training set
 const SMOOTHING = { low: [1.6, 0.8], medium: [0.7, 0.6], high: [0.3, 0.4] };   // One Euro filter [min cutoff Hz, beta]
@@ -44,7 +48,8 @@ $('btnStart').addEventListener('click', async () => {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('This browser cannot use the camera.');
     status(msg, 'Asking for the camera…');
     video.srcObject = await navigator.mediaDevices.getUserMedia({
-      audio: false, video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      // 640 x 480 is plenty for the 256 px face crop MediaPipe uses, and much lighter for phones than 1280 x 720
+      audio: false, video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
     });
     await video.play();
     status(msg, 'Loading the face model (about 4 MB, once)…');
@@ -97,6 +102,8 @@ function tick(now) {
   try { res = S.landmarker.detectForVideo(video, now); } catch (e) { console.error(e); return; }
   const lm = res.faceLandmarks?.[0];
   S.frame = lm ? extractFeatures(lm, res.faceBlendshapes?.[0]?.categories, video.videoWidth, video.videoHeight) : null;
+  if (S.frame) S.frame.closed = closure.closed(S.frame);
+  if (S.stats) { S.stats.frames++; if (!S.frame) S.stats.noFace++; else if (S.frame.closed) S.stats.closed++; }
   frames++;
   if (now - fpsStart >= 1000) { S.fps = frames * 1000 / (now - fpsStart); frames = 0; fpsStart = now; S.luma = measureLuma(); }
   if (S.collector) S.collector(S.frame, now);
@@ -172,8 +179,8 @@ function updateChecks(f) {
     setCheck('size', 'idle', 'Distance: waiting for a face.');
   } else {
     setCheck('face', 'ok', 'Face and both irises found.');
-    const open = f.minOpen > 0.12;
-    setCheck('eyes', open ? 'ok' : 'warn', open ? 'Both eyes open and visible.' : 'Eyes look half closed or hidden (glare on glasses?).');
+    const open = !f.closed;
+    setCheck('eyes', open ? 'ok' : 'warn', open ? 'Both eyes open and visible.' : 'Eyes look closed or hidden (glare on glasses?).');
     const s = f.size;
     setCheck('size', s < 0.09 || s > 0.5 ? 'warn' : 'ok',
       s < 0.09 ? 'Your face is small in the picture: come closer to the camera.'
@@ -200,16 +207,17 @@ async function calibrate() {
   setMode('calib');
   keepAwake();
   const W = innerWidth, H = innerHeight, samples = [];
+  S.stats = { frames: 0, noFace: 0, closed: 0, t0: performance.now() };
   await countdown();
   const pts = calibrationPoints();
   for (let k = 0; k < pts.length; k++) {
     const got = cleanSamples(await collectPoint(pts[k], `Dot ${k + 1} of ${pts.length}`));
     if (S.cancel) return backToSetup('Calibration cancelled.');
     if (got.length >= MIN_SAMPLES) got.forEach(s => samples.push({ ...s, target: pts[k], group: k }));
+    else S.stats.missed = (S.stats.missed || 0) + 1;
   }
-  if (new Set(samples.map(s => s.group)).size < 6) {
-    return backToSetup('Too few dots had a clear view of your eyes. Check the light and keep your face in view, then try again.');
-  }
+  const dots = new Set(samples.map(s => s.group)).size;
+  if (dots < MIN_DOTS) return backToSetup(calibrationProblem(dots, pts.length));
   let model = fitModel(samples);
   const vpts = validationPoints(), val = [];
   for (let k = 0; k < vpts.length; k++) {
@@ -233,8 +241,21 @@ async function calibrate() {
 }
 
 function backToSetup(text) {
+  S.collector = null;
   setMode('setup');
   status($('setupMsg'), text, true);
+}
+
+// say why the dots got too few frames, so the next try can fix the right thing
+function calibrationProblem(dots, total) {
+  const st = S.stats, secs = (performance.now() - st.t0) / 1000, fps = st.frames / secs;
+  const pct = n => Math.round(100 * n / Math.max(st.frames, 1));
+  let tip = 'Keep your face in view and try again.';
+  if (fps < 10) tip = 'The phone was slow. Close other apps and try again.';
+  else if (pct(st.noFace) > 30) tip = 'Your face often left the picture. Hold the phone steady with your whole face in view.';
+  else if (pct(st.closed) > 30) tip = 'Your eyes often looked closed. Hold the phone a little higher, so you look at it straight rather than down, and light your face.';
+  return `Only ${dots} of ${total} dots got enough frames of your eyes (${Math.round(fps)} frames per second, ` +
+    `${pct(st.noFace)} % without a face, ${pct(st.closed)} % with eyes closed). ${tip}`;
 }
 
 function fitModel(samples) {
@@ -265,14 +286,18 @@ function collectPoint([x, y], label) {
       target.style.setProperty('--dur', `${TIME.settle + TIME.collect}ms`);
       target.classList.add('shrink');
       S.collector = (f, now) => {
-        if (now - t0 >= TIME.settle && f && f.blink < BLINK) got.push({ x: f.x, size: f.size, faceX: f.faceX, faceY: f.faceY });
+        if (now - t0 >= TIME.settle && f && !f.closed) got.push({ x: f.x, size: f.size, faceX: f.faceX, faceY: f.faceY });
       };
-      setTimeout(() => {
+      const poll = setInterval(() => {
+        const t = performance.now() - t0;
+        if (!S.cancel && t < TIME.settle + TIME.collect) return;
+        if (!S.cancel && got.length < WANT_SAMPLES && t < TIME.settle + TIME.maxCollect) return;
+        clearInterval(poll);
         S.collector = null;
-        if (got.length >= MIN_SAMPLES || ++tries > 2 || S.cancel) return resolve(got);
+        if (got.length >= MIN_SAMPLES || ++tries > 1 || S.cancel) return resolve(got);
         msg.textContent = 'Lost your eyes for a moment. Look at the dot again.';
         setTimeout(run, 600);
-      }, TIME.settle + TIME.collect);
+      }, 50);
     };
     run();
   });
@@ -285,7 +310,7 @@ function trackFrame(f, now) {
   const dot = $('gaze');
   if (!f) { dot.classList.add('lost'); postureWarning(null, now); return; }
   postureWarning(f, now);
-  if (f.blink >= BLINK) return;                       // hold the last point through a blink
+  if (f.closed) return;                               // hold the last point through a blink
   const [rx, ry] = S.model.predict(f.x);
   const [x, y] = S.filter.filter(clamp(rx, -0.1, 1.1), clamp(ry, -0.1, 1.1), now / 1000);
   S.gaze = { x: clamp(x, 0, 1), y: clamp(y, 0, 1) };
@@ -319,7 +344,7 @@ $('track').addEventListener('pointerdown', ev => {
   const x = ev.clientX / innerWidth, y = ev.clientY / innerHeight, t0 = performance.now(), got = [];
   ripple(ev.clientX, ev.clientY);
   const group = 1000 + (++S.taps);
-  S.collector = (f, now) => { if (f && f.blink < BLINK && now - t0 > 80) got.push({ x: f.x }); };
+  S.collector = (f, now) => { if (f && !f.closed && now - t0 > 80) got.push({ x: f.x }); };
   setTimeout(() => {
     S.collector = null;
     if (got.length < 3) return;
