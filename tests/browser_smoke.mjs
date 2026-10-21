@@ -1,5 +1,6 @@
 // End-to-end check in headless Chromium with a fake camera that plays a face clip.
 //   FAKE_VIDEO=face.y4m node tests/browser_smoke.mjs        (needs: npm i playwright && npx playwright install chromium)
+//   BASE_URL=https://mendeltem.github.io/camera-eye-tracker/ checks the live site instead of a local server
 // A still or slowly drifting photo cannot follow the dots, so this checks the pipeline, not the accuracy:
 // camera -> face model -> setup checks -> calibration -> model fit -> validation -> tracking views, no page errors.
 import { createRequire } from 'node:module';
@@ -23,7 +24,7 @@ const server = http.createServer((req, res) => {
   fs.createReadStream(file).pipe(res);
 }).listen(0, '127.0.0.1');
 await new Promise(r => server.once('listening', r));
-const url = `http://127.0.0.1:${server.address().port}/?test=1`;
+const url = `${process.env.BASE_URL || `http://127.0.0.1:${server.address().port}/`}?test=1`;
 
 const proxy = process.env.https_proxy || process.env.HTTPS_PROXY;
 const browser = await chromium.launch({
