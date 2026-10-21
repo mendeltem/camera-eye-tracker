@@ -90,9 +90,9 @@ try {
   await step('tap correction moves the offset (Kalman filter)', async () => {
     const before = await page.evaluate(() => window.gazeApp.drift.n);
     await page.mouse.click(200, 500);
-    await page.waitForTimeout(800);
-    const d = await page.evaluate(() => ({ n: window.gazeApp.drift.n, beta: window.gazeApp.drift.beta }));
-    if (d.n !== before + 1) throw new Error(`corrections ${before} -> ${d.n}`);
+    await page.waitForTimeout(1200);
+    const d = await page.evaluate(() => ({ n: window.gazeApp.drift.n, beta: window.gazeApp.drift.beta, fps: window.gazeApp.fps }));
+    if (d.n !== before + 1) throw new Error(`corrections ${before} -> ${d.n} at ${Math.round(d.fps)} frames per second`);
     return `offset ${d.beta.map(v => v.toFixed(3)).join(', ')}`;
   });
   await step('after a large move the re-centre dot shows, and a tap on it clears it', async () => {

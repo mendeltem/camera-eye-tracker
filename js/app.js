@@ -410,7 +410,7 @@ function postureWarning(f, now) {
   if (text) toast.textContent = text;
 }
 
-// Tap where you look: half a second of frames measures the offset there, and the Kalman filter takes as much of it as
+// Tap where you look: half a second of frames (longer on a slow phone) measures the offset there, and the Kalman filter takes as much of it as
 // it trusts (most after a move or a long time, less right after the last tap). The tap frames are kept for the export.
 $('track').addEventListener('pointerdown', ev => {
   if (!S.model || ev.target.closest('.toolbar, .result, .clear')) return;
@@ -424,9 +424,13 @@ $('track').addEventListener('pointerdown', ev => {
   ripple(cx, cy);
   const group = 1000 + (++S.taps);
   S.collector = (f, now) => { if (f && !f.closed && now - t0 > 80) got.push({ f, now }); };
-  setTimeout(() => {
+  // at least TIME.tap, longer on a slow phone until 3 frames are in (6 frames per second gave 2 in half a second)
+  const poll = setInterval(() => {
+    const t = performance.now() - t0;
+    if (t < TIME.tap || (got.length < 3 && t < 3 * TIME.tap)) return;
+    clearInterval(poll);
     S.collector = null;
-    if (got.length < 3) return;
+    if (got.length < 3) { $('hint').textContent = 'Could not see your eyes for that tap. Look at the spot and tap again.'; return; }
     const preds = got.map(({ f }) => S.model.predict(f.x, f.irisS));
     const mean = [0, 1].map(a => preds.reduce((s, p) => s + p[a], 0) / preds.length);
     const last = got[got.length - 1].f;
@@ -436,7 +440,7 @@ $('track').addEventListener('pointerdown', ev => {
     anchor.hidden = true;
     got.forEach(({ f, now }) => S.log.push({ phase: 'tap', group, target: [x, y], ...sampleOf(f, now) }));
     $('hint').textContent = `Corrected (${S.taps} tap${S.taps > 1 ? 's' : ''}).`;
-  }, TIME.tap);
+  }, 50);
 });
 function ripple(x, y) {
   const r = Object.assign(document.createElement('div'), { className: 'ripple' });
