@@ -8,24 +8,32 @@ const EYES = [
   { corners: [362, 263], lids: [386, 374] },
 ];
 const IRIS_CENTERS = [468, 473];
+const IRIS_RINGS = [[469, 470, 471, 472], [474, 475, 476, 477]];   // four points on each iris edge
 const NOSE_TIP = 1;
 const CHIN = 152;
 const BLEND = ['eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft',
   'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'];
 
 export const FEATURE_NAMES = [
-  'eyeA_h', 'eyeA_v', 'eyeA_open', 'eyeB_h', 'eyeB_v', 'eyeB_open',
+  'eyeA_h', 'eyeA_v', 'eyeA_vlid', 'eyeA_open', 'eyeB_h', 'eyeB_v', 'eyeB_vlid', 'eyeB_open',
   'blend_hL', 'blend_vL', 'blend_hR', 'blend_vR',
-  'head_yaw', 'head_pitch', 'head_roll', 'face_x', 'face_y', 'face_size',
+  'head_yaw', 'head_pitch', 'head_roll', 'face_x', 'face_y',
   'h_sq', 'v_sq', 'h_v',
 ];
+export const IRIS_KEYS = [0, 1, 4, 5];            // iris offsets of both eyes (outlier check)
+export const POSE_KEYS = [12, 13, 14, 15, 16];    // head pose and face position (range check, drift)
+// smallest spread assumed per pose feature, so a calibration without movement does not make every later wobble "far"
+const POSE_FLOOR = [0.03, 0.03, 0.05, 0.02, 0.02];
 
 const sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1];
 const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
 
-// One eye in its own frame: u along the corner line (image left -> right), v perpendicular (image down).
-// h, v: iris offset from the eye centre / lid midpoint, in eye widths. open: lid gap in eye widths.
+// One eye. h, v: iris offset from the corner midpoint along the image axes, in eye widths. The iris sits in front of
+// the eyeball centre, so this offset measures the angle between the gaze and the line from the eye to the camera:
+// it stays the same when the head moves or turns while the eyes keep looking at the same screen point (to first
+// order), and it rotates with the screen when the head rolls, as the gaze point does. vlid: iris below the lid
+// midpoint (image axis), open: lid gap, both in eye widths.
 export function eyeFrame(pt, eye, irisPoint) {
   let L = pt(eye.corners[0]), R = pt(eye.corners[1]);
   if (L[0] > R[0]) [L, R] = [R, L];
@@ -36,11 +44,19 @@ export function eyeFrame(pt, eye, irisPoint) {
   const top = pt(eye.lids[0]), bottom = pt(eye.lids[1]);
   const lidMid = mid(top, bottom);
   return {
-    h: dot(sub(irisPoint, c), u) / w,
-    v: dot(sub(irisPoint, lidMid), v) / w,
+    h: (irisPoint[0] - c[0]) / w,
+    v: (irisPoint[1] - c[1]) / w,
+    vlid: (irisPoint[1] - lidMid[1]) / w,
     open: dot(sub(bottom, top), v) / w,
     w, c, L, R, top, bottom, iris: irisPoint,
   };
+}
+
+// Iris diameter in pixels: the larger of the two edge-to-edge spans (a sideways look shortens one of them).
+// The visible iris is about 11.7 mm wide in nearly everyone, so its size in the image gives the distance to the camera.
+export function irisDiameter(pt, ring) {
+  const d = (a, b) => Math.hypot(pt(a)[0] - pt(b)[0], pt(a)[1] - pt(b)[1]);
+  return Math.max(d(ring[0], ring[2]), d(ring[1], ring[3]));
 }
 
 // landmarks: [{x, y, z}] normalised to the frame; categories: MediaPipe blendshapes (optional).
@@ -73,8 +89,10 @@ export function extractFeatures(landmarks, categories, W, H) {
 
   const hm = (A.h + B.h) / 2, vm = (A.v + B.v) / 2;
   const size = iod / Math.min(W, H);
-  const x = [A.h, A.v, A.open, B.h, B.v, B.open, ...blend, yaw, pitch, roll, m[0] / W, m[1] / H, size, hm * hm, vm * vm, hm * vm];
-  return { x, blink, size, yaw, pitch, roll, faceX: m[0] / W, faceY: m[1] / H, minOpen: Math.min(A.open, B.open), eyes, iod };
+  const iris = (irisDiameter(pt, IRIS_RINGS[0]) + irisDiameter(pt, IRIS_RINGS[1])) / 2 / W;
+  const x = [A.h, A.v, A.vlid, A.open, B.h, B.v, B.vlid, B.open, ...blend, yaw, pitch, roll, m[0] / W, m[1] / H,
+    hm * hm, vm * vm, hm * vm];
+  return { x, blink, size, iris, yaw, pitch, roll, faceX: m[0] / W, faceY: m[1] / H, minOpen: Math.min(A.open, B.open), eyes, iod };
 }
 
 // ---------------------------------------------------------------- ridge regression
@@ -131,6 +149,8 @@ export class GazeModel {
     for (const x of X) for (let j = 0; j < d; j++) this.sd[j] += (x[j] - this.mu[j]) ** 2 / n;
     for (let j = 0; j < d; j++) this.sd[j] = Math.sqrt(this.sd[j]) > 1e-9 ? Math.sqrt(this.sd[j]) : 1;
     const Z = X.map(x => this.standardise(x));
+    this.zlo = Z[0].map((_, j) => Math.min(...Z.map(z => z[j])) - 1);
+    this.zhi = Z[0].map((_, j) => Math.max(...Z.map(z => z[j])) + 1);
     const all = [...Array(n).keys()];
     const uniq = [...new Set(groups)];
     this.lambda = 0.01; this.cvError = null;
@@ -151,11 +171,13 @@ export class GazeModel {
     return this;
   }
   standardise(x) { return x.map((v, j) => (v - this.mu[j]) / this.sd[j]); }
-  predict(x) { return predictRidge(this.f, this.standardise(x)); }
+  // features are held within the training range plus one standard deviation: a value the fit never saw (a pose far
+  // from calibration) would otherwise be multiplied by a weight that was only ever tested on a tiny spread
+  predict(x) { return predictRidge(this.f, this.standardise(x).map((z, j) => Math.min(this.zhi[j], Math.max(this.zlo[j], z)))); }
 }
 
 // Drop samples whose iris features sit far from the point's median (saccades, half blinks).
-export function cleanSamples(samples, keys = [0, 1, 3, 4], cut = 3.5) {
+export function cleanSamples(samples, keys = IRIS_KEYS, cut = 3.5) {
   if (samples.length < 4) return samples;
   const med = a => { const s = [...a].sort((p, q) => p - q); const k = s.length >> 1; return s.length % 2 ? s[k] : (s[k - 1] + s[k]) / 2; };
   const stats = keys.map(k => {
@@ -164,6 +186,81 @@ export function cleanSamples(samples, keys = [0, 1, 3, 4], cut = 3.5) {
   });
   const kept = samples.filter(s => stats.every(({ k, m, mad }) => mad === 0 || Math.abs(s.x[k] - m) <= cut * mad));
   return kept.length >= samples.length / 2 ? kept : samples;
+}
+
+// ---------------------------------------------------------------- from features to the screen, robust to moving
+
+const median = a => { const s = [...a].sort((p, q) => p - q), k = s.length >> 1; return s.length % 2 ? s[k] : (s[k - 1] + s[k]) / 2; };
+
+// Where the front camera sits, in screen fractions. Only the distance correction uses it, so a rough guess is enough:
+// phones have the camera at the top edge in portrait and at a side in landscape, laptops at the top.
+// angle: screen.orientation.angle, 90 = the top of the phone turned to the left.
+export function cameraPosition(portrait, angle = 0) {
+  if (portrait) return angle === 180 ? [0.5, 1.02] : [0.5, -0.02];
+  if (angle === 90) return [-0.02, 0.5];
+  if (angle === 270 || angle === -90) return [1.02, 0.5];
+  return [0.5, -0.02];
+}
+
+// The ridge model plus geometry, so the head or the phone may move after calibration:
+//  - distance: the gaze point's offset from the camera grows with the distance (offset = distance x tan(angle)), so
+//    targets are brought to the calibration distance before the fit and predictions are scaled back by
+//    rho = distance now / distance at calibration = iris size at calibration / iris size now;
+//  - pose: the calibration includes a phase with the eyes on one dot while the head moves, so the fit learns which
+//    feature changes do not move the gaze point; outside() says how far the pose has gone beyond that range.
+export class GazeMapper {
+  constructor(camera = [0.5, -0.02]) { this.camera = camera; }
+  rho(iris) { return iris > 0 && this.irisRef > 0 ? this.irisRef / iris : 1; }
+  fit(samples) {                       // samples: [{x, iris, target: [x, y], group}]
+    this.irisRef = median(samples.map(s => s.iris || 0));
+    const c = this.camera, toRef = s => { const r = this.rho(s.iris); return [0, 1].map(a => c[a] + (s.target[a] - c[a]) / r); };
+    this.model = new GazeModel().fit(samples.map(s => s.x), samples.map(toRef), samples.map(s => s.group));
+    this.poseLo = POSE_KEYS.map(k => Math.min(...samples.map(s => s.x[k])));
+    this.poseHi = POSE_KEYS.map(k => Math.max(...samples.map(s => s.x[k])));
+    this.poseScale = POSE_KEYS.map((k, i) => Math.max(this.model.sd[k], POSE_FLOOR[i]));
+    return this;
+  }
+  get lambda() { return this.model.lambda; }
+  get cvError() { return this.model.cvError; }
+  predict(x, iris) {
+    const g = this.model.predict(x), r = this.rho(iris), c = this.camera;
+    return [c[0] + r * (g[0] - c[0]), c[1] + r * (g[1] - c[1])];
+  }
+  // how far the head pose is beyond the range seen in calibration, in standard deviations (0 inside)
+  outside(x) {
+    return Math.max(0, ...POSE_KEYS.map((k, i) => Math.max(this.poseLo[i] - x[k], x[k] - this.poseHi[i]) / this.poseScale[i]));
+  }
+  poseVector(x) { return POSE_KEYS.map((k, i) => x[k] / this.poseScale[i]); }
+}
+
+// ---------------------------------------------------------------- drift (Kalman filter)
+
+// The slow offset of the gaze point (drift over minutes, a new grip on the phone) is the state of a Kalman filter
+// (Kalman 1960), modelled as a random walk: its variance P grows with the time since the last correction and with how
+// far the pose has moved since then. A tap where the user looks measures the offset, and the gain K = P / (P + R)
+// decides how much of it to take: nearly all of it after a big move, a share when the last correction was recent.
+// Jitter is left to the One Euro filter; this one only carries the offset.
+export class DriftFilter {
+  constructor({ p0 = 0.05 ** 2, qTime = 0.003 ** 2, qPose = 0.03 ** 2, r = 0.03 ** 2 } = {}) {
+    Object.assign(this, { qTime, qPose, r });
+    this.reset(p0);
+  }
+  reset(p0 = this.p0, tSec = null, pose = null) {
+    Object.assign(this, { p0, P: p0, beta: [0, 0], t: tSec, pose, n: 0 });
+  }
+  variance(tSec, pose) {               // tSec in seconds, pose from GazeMapper.poseVector
+    let P = this.P;
+    if (this.t !== null) P += this.qTime * Math.max(0, tSec - this.t);
+    if (this.pose && pose) P += this.qPose * this.pose.reduce((s, v, i) => s + (pose[i] - v) ** 2, 0);
+    return P;
+  }
+  correct(err, tSec, pose, r = this.r) {   // err: tapped point - (prediction + offset), screen fractions
+    const P = this.variance(tSec, pose), K = P / (P + r);
+    this.beta = [this.beta[0] + K * err[0], this.beta[1] + K * err[1]];
+    Object.assign(this, { P: (1 - K) * P, t: tSec, pose, n: this.n + 1 });
+    return K;
+  }
+  apply([x, y]) { return [x + this.beta[0], y + this.beta[1]]; }
 }
 
 // ---------------------------------------------------------------- smoothing (One Euro filter, Casiez et al. 2012)

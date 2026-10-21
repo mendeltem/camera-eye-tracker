@@ -7,7 +7,7 @@
 <meta name="description" content="Eye tracking in the browser with the normal front camera. The video stays on your device.">
 <title>Camera Eye Tracker</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M2 16s5-9 14-9 14 9 14 9-5 9-14 9S2 16 2 16z' fill='none' stroke='%230f6e6a' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23e4572e'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=2">
+<link rel="stylesheet" href="style.css?v=3">
 </head>
 <body data-mode="intro" data-view="figs">
 
@@ -20,14 +20,14 @@
     <h1>Camera Eye Tracker</h1>
     <p class="lead">See where you look on this screen with nothing but the normal camera. Three figures light up only while you look at them. The camera picture is never shown and never leaves this device.</p>
     <ol class="steps">
-      <li><b>Set up.</b> Face in view, light on your face, device held still.</li>
-      <li><b>Calibrate.</b> Follow 9 dots with your eyes (about 20 seconds), then 4 test dots that measure the error.</li>
+      <li><b>Set up.</b> Face in view, light on your face.</li>
+      <li><b>Calibrate.</b> Follow 9 dots with your eyes, then keep looking at one dot while you turn your head a little, then 4 test dots measure the error (about 30 seconds).</li>
       <li><b>Look.</b> The figure you look at lights up, and a dot shows where your eyes point. Tap where you are looking to correct it.</li>
     </ol>
     <button id="btnStart" class="primary" type="button">Start camera</button>
     <p id="introStatus" class="status" role="status"></p>
-    <p class="fine">The camera can sit anywhere: above, below or beside the screen, or as an external webcam. Calibration learns where it is. Keep it in the same place afterwards.</p>
-    <p class="fine" id="accuracyNote">Expect an error of about 2 to 3 cm on a phone (best case about 1.5 cm). Glasses, poor light and head movement make it worse. That is enough to tell which part of the screen you look at, not which word you read. After calibration the app measures your own error and shows it.</p>
+    <p class="fine">The camera can sit anywhere: above, below or beside the screen, or as an external webcam. Calibration learns where it is. Afterwards you may move a little and change the distance; if you move too far, the app shows a dot to look at and tap once.</p>
+    <p class="fine" id="accuracyNote">Expect an error of about 2 to 3 cm on a phone (best case about 1.5 cm). Glasses, poor light and large head movements make it worse. That is enough to tell which part of the screen you look at, not which word you read. After calibration the app measures your own error and shows it.</p>
   </div>
 </main>
 
@@ -44,7 +44,8 @@
     </ul>
     <p id="setupMsg" class="status" role="status"></p>
     <button id="btnCalibrate" class="primary" type="button" disabled>Start calibration</button>
-    <p class="fine">During calibration keep your head still and follow each dot with your eyes until it has shrunk.</p>
+    <p class="fine">Follow each dot with your eyes until it has shrunk. Near the end, keep looking at one dot and turn your head slowly the way the text says.</p>
+    <p id="saveLast" class="fine" hidden><button id="btnSave2" class="linkish" type="button">Save the data of the last calibration</button> (numbers only, no picture; stays on this device)</p>
   </div>
 </main>
 
@@ -81,6 +82,7 @@
   </header>
   <p id="hint" class="hint"></p>
   <button type="button" class="ghost clear" id="btnClear" hidden>Clear heat</button>
+  <div id="anchor" class="anchor" hidden><span class="ring"></span><span class="core"></span></div>
   <div id="gaze" class="gaze lost" aria-hidden="true"></div>
   <div id="toast" class="toast" role="status" hidden></div>
   <div id="result" class="result" role="dialog" aria-labelledby="resultTitle" hidden>
@@ -89,9 +91,10 @@
     <p class="fine">Crosses: the test dots. Filled dots: where the tracker thought you looked.</p>
     <button id="btnOk" class="primary" type="button">Start tracking</button>
     <button id="btnRecal2" class="ghost" type="button" hidden>Recalibrate</button>
+    <p class="fine"><button id="btnSave" class="linkish" type="button">Save the data</button> (numbers only, no picture; stays on this device) to try later model versions on your own calibration.</p>
   </div>
 </div>
 
-<script type="module" src="js/app.js?v=2"></script>
+<script type="module" src="js/app.js?v=3"></script>
 </body>
 </html>

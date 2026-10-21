@@ -8,22 +8,27 @@ look at lights up, and a dot shows where your eyes point.
 - The camera picture is never shown and never leaves the device. Face landmarks are computed in the browser
   (MediaPipe Face Landmarker, WebAssembly); nothing is uploaded, nothing is stored.
 - The camera can sit anywhere: above, below or beside the screen, or an external webcam. Calibration learns the
-  geometry. Keep camera and screen in the same place afterwards.
+  geometry. Afterwards head and phone may move a little and the distance may change; after a large move the app
+  shows a dot to look at and tap once.
 - No build step, no server code: three static files and one JavaScript module, served by GitHub Pages.
 
 ## How to use it
 
 1. **Set up.** The app draws your two eyes as it sees them (from landmarks, not the camera picture) and checks face,
    open eyes, distance, light and frame rate.
-2. **Calibrate.** Follow 9 dots with your eyes, about 20 seconds, head still. Then 4 test dots measure the error,
-   which the app shows in pixels and as a share of the screen diagonal.
+2. **Calibrate.** Follow 9 dots with your eyes. Then keep looking at one dot while you turn your head slowly left,
+   right, up and down (or tilt the phone). Then 4 test dots measure the error, which the app shows in pixels and as
+   a share of the screen diagonal. About 30 seconds in all.
 3. **Look.** *Figures*: the figure you look at lights up; hold your gaze about a second and it hops.
    *Dot*: the gaze point alone. *Heat*: where you looked builds up colour.
-   Tap the spot you are looking at to correct the tracker; each tap adds half a second of training frames.
+   Tap the spot you are looking at to correct the tracker: half a second of frames measures the offset there.
 
-Good results need light on your face (a bright screen helps), a steady head and the device at the distance you
-calibrated at. Glasses with reflections, a dark room or a window behind you make it worse. Turning the phone means
-calibrating again.
+Good results need light on your face (a bright screen helps). Glasses with reflections, a dark room or a window behind
+you make it worse. Turning the phone between portrait and landscape means calibrating again.
+
+After calibration the result card offers **Save the data**: a JSON file with the features, targets and timings of the
+calibration (numbers only, no picture), saved on your device. It lets a later version of the model be tried on a
+real calibration.
 
 ## Accuracy you can expect
 
@@ -45,20 +50,52 @@ This app uses hand-built eye features and a per-person regression, closer to Web
 
 ```
 front camera ─► MediaPipe Face Landmarker (478 points incl. iris, blendshapes)
-             ─► 19 features: per eye the iris offset in the eye's own frame (along / across the corner line, in eye
-                widths) and the lid gap; blendshape gaze (look in/out/up/down); head yaw, pitch, roll from the
-                landmarks; face position and size in the frame; three quadratic terms
-             ─► ridge regression to the screen point, features standardised, lambda chosen by
-                leave-one-calibration-dot-out cross-validation
-             ─► One Euro filter (Casiez et al. 2012), blinks skipped (eyeBlink blendshape)
+             ─► 20 features: per eye the iris offset from the eye-corner midpoint along the image axes and below the
+                lid midpoint (in eye widths) and the lid gap; blendshape gaze (look in/out/up/down); head yaw, pitch,
+                roll and face position from the landmarks; three quadratic terms. Iris diameter for the distance.
+             ─► ridge regression to the screen point, features standardised and held within the calibrated range,
+                lambda chosen by leave-one-calibration-dot-out cross-validation
+             ─► distance correction (iris size), offset carried by a Kalman filter that taps update
+             ─► One Euro filter (Casiez et al. 2012), closed eyes skipped
              ─► figures / dot / heat view
 ```
 
-- Eye features are measured in the eye's own frame, so a tilted head or a camera off to the side does not shift them;
-  head pose and face position are separate features, so the regression learns where the camera is.
-- Calibration frames are taken only after the eyes have settled on each dot (700 ms), outliers per dot are dropped
-  (median absolute deviation), and the 4 test dots are scored before they join the training set.
+- Calibration frames are taken only after the eyes have settled on each dot, outliers per dot are dropped (median
+  absolute deviation), and the 4 test dots are scored before they join the training set.
 - `js/gaze.js` holds all the math and has no browser code; `js/app.js` is camera, screens and drawing.
+
+### Moving after calibration
+
+A regression fitted while head and phone stayed still has never seen the pose change. Its weights for head pose and
+face position were fitted on a tiny spread, and a later move multiplies them by values far outside it, so the point
+jumps. Four parts address this:
+
+1. **Features that move with the gaze, not with the head.** The iris sits in front of the eyeball centre, so its
+   offset in the image measures the angle between the gaze and the line from the eye to the camera. To first order
+   it stays the same when the head moves or turns while the eyes keep looking at the same screen point, and it
+   rotates with the screen when the head rolls, as the gaze point does. The offset is therefore measured along the
+   image axes, not in the eye's own tilted frame.
+2. **A movement phase in the calibration.** The eyes stay on one dot while the head turns. These frames teach the
+   fit which feature changes do not move the gaze point (for example lids and blendshapes, which follow the eye in
+   the head). Features are held within the calibrated range plus one standard deviation, so a pose beyond it cannot
+   throw the point across the screen.
+3. **Distance from the iris size.** The visible iris is about 11.7 mm wide in nearly everyone (Vakunov & Lagun
+   2020), so its size in the image gives the distance relative to calibration. The gaze point's offset from the
+   camera grows with the distance, and predictions are scaled by that ratio. The camera position this needs is a
+   guess (top edge in portrait, side in landscape); only the distance correction uses it.
+4. **The slow offset as a Kalman state.** Drift and a new grip shift the whole point. The offset is the state of a
+   Kalman filter (Kalman 1960), modelled as a random walk whose variance grows with time and with how far the pose
+   moved since the last correction. A tap where you look measures it, and the gain decides how much to take: nearly
+   all after a large move, a share right after the previous tap. When the pose leaves the calibrated range for a
+   second, a dot appears in the middle to look at and tap.
+
+The phone's gyroscope is not used. It measures how the phone turns in the room, while the gaze point depends on
+the phone relative to the head, which the camera already sees. Walking with the phone held still in front of the face
+would read as movement, and iOS would ask for one more permission.
+
+The toy simulation in `tests/gaze.test.mjs` shows the mechanism: after a head turn the error with the movement
+phase stays at the still error, without it the error grows to about a quarter of the screen. That simulation
+follows the assumptions above; the gain on a real phone has not been measured yet.
 
 ## Run it yourself
 
@@ -80,6 +117,8 @@ FAKE_VIDEO=face.y4m node tests/browser_smoke.mjs
 - Tested in headless Chromium with a fake camera; check it on your own phone (Chrome on Android, Safari on iOS 15.4+).
 - `detectForVideo` runs on the main thread; on slow phones a Web Worker would keep the page smoother.
 - Accuracy drifts over minutes (head and lighting change). Tap corrections help; recalibrate when the dot is off.
+- The offset is one value for the whole screen and every pose: after a re-centre far from the calibrated pose,
+  going back may need another tap.
 - Possible gains: kernel ridge regression, a smooth-pursuit calibration with more frames, a small eye-image patch.
 
 ## Sources
@@ -106,6 +145,12 @@ Each was opened and checked on 2026-10-21.
 - Davalos E et al. (2025). WebEyeTrack: Scalable eye-tracking for the browser via on-device few-shot
   personalization. arXiv:2508.19544. MediaPipe landmarks plus an eye-patch model adapted with up to 9 calibration
   samples; 2.32 cm on GazeCapture, error drifts over 20-minute sessions.
+- Vakunov A, Lagun D (2020). MediaPipe Iris: Real-time iris tracking and depth estimation. Google Research blog,
+  2020-08-06. https://research.google/blog/mediapipe-iris-real-time-iris-tracking-depth-estimation/
+  Horizontal iris diameter 11.7 ± 0.5 mm across a wide population; distance from iris size with a mean relative
+  error of 4.3 % against a depth sensor.
+- Kalman RE (1960). A new approach to linear filtering and prediction problems. J Basic Eng 82(1):35-45.
+  doi:10.1115/1.3662552. The recursive estimator used here for the offset.
 - Casiez G, Roussel N, Vogel D (2012). 1 € filter: A simple speed-based low-pass filter for noisy input in
   interactive systems. CHI 2012. https://gery.casiez.net/1euro/. The smoothing filter used here, re-implemented.
 - MediaPipe Face Landmarker for Web. https://developers.google.com/edge/mediapipe/solutions/vision/face_landmarker/web_js

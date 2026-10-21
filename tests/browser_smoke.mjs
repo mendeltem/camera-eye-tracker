@@ -2,7 +2,8 @@
 //   FAKE_VIDEO=face.y4m node tests/browser_smoke.mjs        (needs: npm i playwright && npx playwright install chromium)
 //   BASE_URL=https://mendeltem.github.io/camera-eye-tracker/ checks the live site instead of a local server
 // A still or slowly drifting photo cannot follow the dots, so this checks the pipeline, not the accuracy:
-// camera -> face model -> setup checks -> calibration -> model fit -> validation -> tracking views, no page errors.
+// camera -> face model -> setup checks -> calibration with movement phase -> model fit -> validation -> data export ->
+// tracking views, tap correction (Kalman offset), re-centre dot after a large move, no page errors.
 import { createRequire } from 'node:module';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -65,11 +66,20 @@ try {
     await page.waitForSelector('body[data-mode="track"]', { timeout: 120000 });
     return await page.evaluate(() => {
       const s = window.gazeApp;
-      return `${s.train.length} samples, lambda ${s.model.lambda}, test error ${s.val ? Math.round(s.val.meanPx) + ' px' : 'none'}`;
+      const moves = s.train.filter(x => x.group === 50).length;
+      if (!moves) throw new Error('no frames from the movement phase');
+      return `${s.train.length} samples (${moves} while moving), lambda ${s.model.lambda}, test error ${s.val ? Math.round(s.val.meanPx) + ' px' : 'none'}`;
     });
   });
   await step('result card shows the measured error', async () => (await page.textContent('#resultText')).slice(0, 70));
   await shot('4-result');
+  await step('data export saves numbers, no picture', async () => {
+    const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#btnSave')]);
+    const text = fs.readFileSync(await dl.path(), 'utf8'), data = JSON.parse(text);
+    if (!data.samples?.length || data.features?.length !== data.samples[0].x.length) throw new Error('samples missing or wrong width');
+    if (/data:image|base64/.test(text)) throw new Error('image data in the export');
+    return `${dl.suggestedFilename()}, ${data.samples.length} samples, ${Math.round(text.length / 1024)} kB`;
+  });
   await page.click('#btnOk');
   await step('gaze dot moves on screen', async () => {
     await page.waitForTimeout(1500);
@@ -77,13 +87,25 @@ try {
     if (!g || !Number.isFinite(g.x) || !Number.isFinite(g.y)) throw new Error('no gaze estimate');
     return `x ${g.x.toFixed(2)}, y ${g.y.toFixed(2)}`;
   });
-  await step('tap correction refits the model', async () => {
-    const before = await page.evaluate(() => window.gazeApp.train.length);
+  await step('tap correction moves the offset (Kalman filter)', async () => {
+    const before = await page.evaluate(() => window.gazeApp.drift.n);
     await page.mouse.click(200, 500);
     await page.waitForTimeout(800);
-    const after = await page.evaluate(() => window.gazeApp.train.length);
-    if (after <= before) throw new Error(`training set ${before} -> ${after}`);
-    return `${before} -> ${after} samples`;
+    const d = await page.evaluate(() => ({ n: window.gazeApp.drift.n, beta: window.gazeApp.drift.beta }));
+    if (d.n !== before + 1) throw new Error(`corrections ${before} -> ${d.n}`);
+    return `offset ${d.beta.map(v => v.toFixed(3)).join(', ')}`;
+  });
+  await step('after a large move the re-centre dot shows, and a tap on it clears it', async () => {
+    // pretend the calibrated pose range lies far away, so the current pose counts as a large move not yet re-centred
+    await page.evaluate(() => { window.gazeApp.far.anchor = null; const m = window.gazeApp.model; m.saved = [m.poseLo, m.poseHi]; m.poseLo = m.poseLo.map(v => v + 5); m.poseHi = m.poseHi.map(v => v + 5); });
+    // the dot is a zero-size anchor for its rings, so check the hidden flag rather than Playwright's visibility
+    await page.waitForFunction(() => !document.getElementById('anchor').hidden, null, { timeout: 5000 });
+    const toast = await page.textContent('#toast');
+    await shot('5-recentre');
+    await page.mouse.click(195, 422);
+    await page.waitForFunction(() => document.getElementById('anchor').hidden && window.gazeApp.far.anchor, null, { timeout: 3000 });
+    await page.evaluate(() => { const m = window.gazeApp.model; [m.poseLo, m.poseHi] = m.saved; });
+    return toast.slice(0, 50);
   });
   await step('figures view: three figures, at most one lit', async () => {
     await page.waitForTimeout(1500);
@@ -95,12 +117,12 @@ try {
     const box = await page.$eval('#video', v => v.getBoundingClientRect().width);
     if (box > 4) throw new Error(`video is ${box}px wide`);
   });
-  await shot('5-figures');
+  await shot('6-figures');
   await page.click('.seg button[data-view="dot"]');
   await page.waitForTimeout(500);
   await page.click('.seg button[data-view="heat"]');
   await page.waitForTimeout(1500);
-  await shot('6-heatmap');
+  await shot('7-heatmap');
   await step('no page errors', async () => { if (problems.length) throw new Error(problems.join(' | ')); });
 } catch (e) { if (!results.some(r => r.startsWith('FAIL'))) results.push(`FAIL  ${e.message.split('\n')[0]}`); } finally {
   console.log(results.join('\n'));
@@ -108,4 +130,4 @@ try {
   await browser.close();
   server.close();
 }
-process.exit(results.some(r => r.startsWith('FAIL')) || results.length < 10 ? 1 : 0);
+process.exit(results.some(r => r.startsWith('FAIL')) || results.length < 12 ? 1 : 0);

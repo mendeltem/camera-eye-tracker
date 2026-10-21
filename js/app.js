@@ -1,15 +1,16 @@
 // Camera Eye Tracker: front camera -> MediaPipe Face Landmarker -> eye features -> ridge regression -> screen point.
 // Everything runs in the browser; no frame leaves the device.
 import { FaceLandmarker, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs';
-import { extractFeatures, GazeModel, OneEuro2D, EyeClosure, cleanSamples, errorStats, calibrationPoints, validationPoints } from './gaze.js?v=2';
+import { extractFeatures, GazeMapper, DriftFilter, OneEuro, OneEuro2D, EyeClosure, cleanSamples, errorStats, calibrationPoints,
+  validationPoints, cameraPosition, FEATURE_NAMES } from './gaze.js?v=3';
 
 const MEDIAPIPE_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 const TEST = new URLSearchParams(location.search).has('test');   // short timings for tests/browser_smoke.mjs
 // per dot: wait `settle` for the eyes to land, collect at least `collect`, keep going up to `maxCollect` until
 // `want` frames are in (slow phones), accept the dot with `minSamples` (real phone 2026-10-21: 8 in 1 s failed at 6 fps)
-const TIME = TEST ? { intro: 200, count: 100, settle: 150, collect: 350, maxCollect: 700, tap: 250 }
-                  : { intro: 1800, count: 500, settle: 700, collect: 1000, maxCollect: 2500, tap: 500 };
+const TIME = TEST ? { intro: 200, count: 100, settle: 150, collect: 350, maxCollect: 700, tap: 250, move: 150 }
+                  : { intro: 1800, count: 500, settle: 700, collect: 1000, maxCollect: 2500, tap: 500, move: 1000 };
 const WANT_SAMPLES = TEST ? 6 : 12;
 const MIN_SAMPLES = TEST ? 3 : 4;
 const MIN_DOTS = 5;                   // of 9 calibration dots
@@ -17,18 +18,25 @@ const closure = new EyeClosure();
 const DWELL_MS = 1100;
 const MAX_TAPS = 12;                  // tap corrections kept in the training set
 const SMOOTHING = { low: [1.6, 0.8], medium: [0.7, 0.6], high: [0.3, 0.4] };   // One Euro filter [min cutoff Hz, beta]
+// movement phase: eyes stay on the centre dot while the head turns, one cue per TIME.move
+const MOVES = ['to the left', 'to the right', 'up', 'down', 'back to the middle'];
+const ARROWS = ['←', '→', '↑', '↓', '•'];
+const RHO_RANGE = [0.7, 1.45];        // distance now / at calibration that the distance correction is trusted for
+const FAR_SD = 1.5, FAR_MS = 1000;     // beyond the calibrated pose range by this much, this long: ask for a re-centre tap
 
 const $ = id => document.getElementById(id);
 const video = $('video');
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const median = a => { const s = [...a].sort((p, q) => p - q), k = s.length >> 1; return s.length % 2 ? s[k] : (s[k - 1] + s[k]) / 2; };
 
 const S = {
   mode: 'intro', view: 'figs', frame: null, fps: 0, luma: null, delegate: null, landmarker: null,
-  model: null, train: [], ref: null, screen: null, val: null, taps: 0, cancel: false,
+  model: null, screen: null, val: null, taps: 0, cancel: false, log: [],
   collector: null, gaze: null, filter: new OneEuro2D(...SMOOTHING.medium), dwell: { i: -1, t0: 0 },
+  drift: new DriftFilter(), far: { since: null, anchor: null },
 };
+// the distance changes slowly: the iris size is smoothed before it scales the gaze point
+const irisFilter = new OneEuro(0.5, 0);
 window.gazeApp = S;                   // read by the browser test
 
 function setMode(mode) {
@@ -102,7 +110,7 @@ function tick(now) {
   try { res = S.landmarker.detectForVideo(video, now); } catch (e) { console.error(e); return; }
   const lm = res.faceLandmarks?.[0];
   S.frame = lm ? extractFeatures(lm, res.faceBlendshapes?.[0]?.categories, video.videoWidth, video.videoHeight) : null;
-  if (S.frame) S.frame.closed = closure.closed(S.frame);
+  if (S.frame) { S.frame.closed = closure.closed(S.frame); S.frame.irisS = irisFilter.filter(S.frame.iris, now / 1000); }
   if (S.stats) { S.stats.frames++; if (!S.frame) S.stats.noFace++; else if (S.frame.closed) S.stats.closed++; }
   frames++;
   if (now - fpsStart >= 1000) { S.fps = frames * 1000 / (now - fpsStart); frames = 0; fpsStart = now; S.luma = measureLuma(); }
@@ -200,7 +208,7 @@ function updateChecks(f) {
 
 $('btnCalibrate').addEventListener('click', calibrate);
 $('btnCancel').addEventListener('click', () => { S.cancel = true; });
-$('btnRecal').addEventListener('click', () => { status($('setupMsg'), ''); setMode('setup'); });
+$('btnRecal').addEventListener('click', () => { status($('setupMsg'), ''); toSetup(); });
 
 async function calibrate() {
   S.cancel = false;
@@ -218,22 +226,29 @@ async function calibrate() {
   }
   const dots = new Set(samples.map(s => s.group)).size;
   if (dots < MIN_DOTS) return backToSetup(calibrationProblem(dots, pts.length));
-  let model = fitModel(samples);
+  // eyes on one dot while the head turns: teaches the fit which feature changes do not move the gaze point
+  const moved = cleanSamples(await collectMoves(), undefined, 5);
+  if (S.cancel) return backToSetup('Calibration cancelled.');
+  if (moved.length >= MIN_SAMPLES) moved.forEach(s => samples.push({ ...s, target: [0.5, 0.5], group: 50 }));
+  const camera = cameraPosition(H >= W, screenAngle());
+  let model = new GazeMapper(camera).fit(samples);
   const vpts = validationPoints(), val = [];
   for (let k = 0; k < vpts.length; k++) {
     const got = cleanSamples(await collectPoint(vpts[k], `Test dot ${k + 1} of ${vpts.length}`));
     if (S.cancel) return backToSetup('Calibration cancelled.');
-    val.push({ target: vpts[k], preds: got.map(s => model.predict(s.x)) });
+    val.push({ target: vpts[k], preds: got.map(s => model.predict(s.x, s.iris)) });
     got.forEach(s => samples.push({ ...s, target: vpts[k], group: 100 + k }));
   }
   S.val = errorStats(val, W, H);            // measured before the test dots join the training set
   S.train = samples;
-  S.model = fitModel(samples);
+  S.model = new GazeMapper(camera).fit(samples);
   S.taps = 0;
-  S.ref = {
-    size: median(samples.map(s => s.size)), faceX: median(samples.map(s => s.faceX)), faceY: median(samples.map(s => s.faceY)),
-  };
-  S.screen = { portrait: H >= W };
+  S.screen = { portrait: H >= W, w: W, h: H };
+  // the offset starts as uncertain as the test dots were off; the clock and pose start now
+  const p0 = Math.max(0.03, (S.val?.meanPx ?? 0.1 * Math.min(W, H)) / Math.min(W, H)) ** 2;
+  S.drift.reset(p0, performance.now() / 1000, S.model.poseVector(samples[samples.length - 1].x));
+  S.far = { since: null, anchor: null };
+  S.log = samples.map(s => ({ phase: s.group === 50 ? 'move' : s.group >= 100 ? 'test' : 'dot', group: s.group, target: s.target, t: s.t, iris: s.iris, x: s.x }));
   S.filter.reset();
   setMode('track');
   layoutTrack();
@@ -242,8 +257,29 @@ async function calibrate() {
 
 function backToSetup(text) {
   S.collector = null;
-  setMode('setup');
+  toSetup();
   status($('setupMsg'), text, true);
+}
+function toSetup() {
+  $('anchor').hidden = true;
+  $('saveLast').hidden = !S.log.length;
+  setMode('setup');
+}
+
+// Numbers only (features, targets, times, screen size; no picture): lets a later version of the model be tried on
+// a real calibration. Saved on this device; nothing is sent anywhere.
+function saveData() {
+  const data = {
+    app: 'camera-eye-tracker', format: 1, saved: new Date().toISOString(), features: FEATURE_NAMES,
+    screen: S.screen, camera: S.model?.camera, video: [video.videoWidth, video.videoHeight], fps: Math.round(S.fps),
+    testError: S.val && { meanPx: S.val.meanPx, pctDiag: S.val.pctDiag }, samples: S.log,
+  };
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' })),
+    download: `eye-tracker-data-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.json`,
+  });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 // say why the dots got too few frames, so the next try can fix the right thing
@@ -258,8 +294,9 @@ function calibrationProblem(dots, total) {
     `${pct(st.noFace)} % without a face, ${pct(st.closed)} % with eyes closed). ${tip}`;
 }
 
-function fitModel(samples) {
-  return new GazeModel().fit(samples.map(s => s.x), samples.map(s => s.target), samples.map(s => s.group));
+function screenAngle() {
+  const a = screen.orientation?.angle ?? window.orientation ?? 0;
+  return ((a % 360) + 360) % 360;
 }
 
 async function countdown() {
@@ -286,7 +323,7 @@ function collectPoint([x, y], label) {
       target.style.setProperty('--dur', `${TIME.settle + TIME.collect}ms`);
       target.classList.add('shrink');
       S.collector = (f, now) => {
-        if (now - t0 >= TIME.settle && f && !f.closed) got.push({ x: f.x, size: f.size, faceX: f.faceX, faceY: f.faceY });
+        if (now - t0 >= TIME.settle && f && !f.closed) got.push(sampleOf(f, now));
       };
       const poll = setInterval(() => {
         const t = performance.now() - t0;
@@ -303,15 +340,40 @@ function collectPoint([x, y], label) {
   });
 }
 
+const sampleOf = (f, now) => ({ x: f.x, iris: f.irisS, t: Math.round(now) });
+
+// Eyes on the centre dot while the head turns a little each way (or the phone tilts): one cue per TIME.move.
+function collectMoves() {
+  const target = $('target'), msg = $('calibMsg'), got = [], t0 = performance.now();
+  target.style.left = '50%'; target.style.top = '50%';
+  target.classList.remove('shrink');
+  void target.offsetWidth;
+  target.style.setProperty('--dur', `${TIME.settle + MOVES.length * TIME.move}ms`);
+  target.classList.add('shrink');
+  msg.textContent = 'Keep your eyes on the dot.';
+  S.collector = (f, now) => { if (now - t0 >= TIME.settle && f && !f.closed) got.push(sampleOf(f, now)); };
+  return new Promise(resolve => {
+    const poll = setInterval(() => {
+      const t = performance.now() - t0, k = Math.floor((t - TIME.settle) / TIME.move);
+      if (k >= 0 && k < MOVES.length) msg.innerHTML = `Keep your eyes on the dot and slowly turn your head ${MOVES[k]} <span class="arrow">${ARROWS[k]}</span><br><small>or tilt the phone a little</small>`;
+      if (!S.cancel && t < TIME.settle + MOVES.length * TIME.move) return;
+      clearInterval(poll);
+      S.collector = null;
+      resolve(got);
+    }, 50);
+  });
+}
+
 // ------------------------------------------------------------------ tracking
 
 function trackFrame(f, now) {
   if (!S.model) return;
   const dot = $('gaze');
   if (!f) { dot.classList.add('lost'); postureWarning(null, now); return; }
+  watchRange(f, now);
   postureWarning(f, now);
   if (f.closed) return;                               // hold the last point through a blink
-  const [rx, ry] = S.model.predict(f.x);
+  const [rx, ry] = S.drift.apply(S.model.predict(f.x, f.irisS));
   const [x, y] = S.filter.filter(clamp(rx, -0.1, 1.1), clamp(ry, -0.1, 1.1), now / 1000);
   S.gaze = { x: clamp(x, 0, 1), y: clamp(y, 0, 1) };
   const px = S.gaze.x * innerWidth, py = S.gaze.y * innerHeight;
@@ -321,37 +383,59 @@ function trackFrame(f, now) {
   else if (S.view === 'heat') paintHeat(px, py);
 }
 
+// Beyond the calibrated pose range for a second, and not yet re-centred there: show the centre dot and ask for a tap.
+function watchRange(f, now) {
+  const far = S.model.outside(f.x) > FAR_SD;
+  const pose = S.model.poseVector(f.x), a = S.far.anchor;
+  const recentred = a && Math.hypot(...pose.map((v, i) => v - a[i])) < FAR_SD;
+  if (!far || recentred) S.far.since = null;
+  else if (S.far.since === null) S.far.since = now;
+  $('anchor').hidden = !(S.far.since !== null && now - S.far.since > FAR_MS);
+}
+
 let lastWarn = 0;
 function postureWarning(f, now) {
   if (now - lastWarn < 400) return;
   lastWarn = now;
-  const r = S.ref;
   let text = null;
+  const rho = f ? S.model.rho(f.irisS) : 1;
   if (S.screen && S.screen.portrait !== (innerHeight >= innerWidth)) text = 'The screen turned. Turn it back or recalibrate.';
   else if (!f) text = 'No face in view.';
-  else if (f.size > r.size * 1.2) text = 'Closer than during calibration: move back a little.';
-  else if (f.size < r.size / 1.2) text = 'Farther than during calibration: come a little closer.';
-  else if (Math.abs(f.faceX - r.faceX) > 0.12 || Math.abs(f.faceY - r.faceY) > 0.12) text = 'Your head moved. Go back to where you were, or recalibrate.';
+  else if (rho < RHO_RANGE[0]) text = 'Much closer than during calibration: move back a little.';
+  else if (rho > RHO_RANGE[1]) text = 'Much farther than during calibration: come a little closer.';
+  else if (!$('anchor').hidden) text = 'You moved a lot. Look at the dot in the middle and tap it, or recalibrate.';
   else if (S.luma !== null && S.luma < 45) text = 'It got dark. Light your face.';
   const toast = $('toast');
   toast.hidden = !text;
   if (text) toast.textContent = text;
 }
 
-// tap where you look: half a second of frames joins the training set at the tap point
+// Tap where you look: half a second of frames measures the offset there, and the Kalman filter takes as much of it as
+// it trusts (most after a move or a long time, less right after the last tap). The tap frames are kept for the export.
 $('track').addEventListener('pointerdown', ev => {
   if (!S.model || ev.target.closest('.toolbar, .result, .clear')) return;
-  const x = ev.clientX / innerWidth, y = ev.clientY / innerHeight, t0 = performance.now(), got = [];
-  ripple(ev.clientX, ev.clientY);
+  let [cx, cy] = [ev.clientX, ev.clientY];
+  const anchor = $('anchor');
+  if (!anchor.hidden) {                               // a tap near the centre dot counts as looking at its centre
+    const r = anchor.getBoundingClientRect(), ax = r.left + r.width / 2, ay = r.top + r.height / 2;
+    if (Math.hypot(cx - ax, cy - ay) < 60) [cx, cy] = [ax, ay];
+  }
+  const x = cx / innerWidth, y = cy / innerHeight, t0 = performance.now(), got = [];
+  ripple(cx, cy);
   const group = 1000 + (++S.taps);
-  S.collector = (f, now) => { if (f && !f.closed && now - t0 > 80) got.push({ x: f.x }); };
+  S.collector = (f, now) => { if (f && !f.closed && now - t0 > 80) got.push({ f, now }); };
   setTimeout(() => {
     S.collector = null;
     if (got.length < 3) return;
-    got.forEach(s => S.train.push({ ...s, target: [x, y], group }));
-    S.train = S.train.filter(s => s.group < 1000 || s.group > group - MAX_TAPS);
-    S.model = fitModel(S.train);
-    $('hint').textContent = `Corrected with ${Math.min(S.taps, MAX_TAPS)} tap${S.taps > 1 ? 's' : ''}.`;
+    const preds = got.map(({ f }) => S.model.predict(f.x, f.irisS));
+    const mean = [0, 1].map(a => preds.reduce((s, p) => s + p[a], 0) / preds.length);
+    const last = got[got.length - 1].f;
+    const pose = S.model.poseVector(last.x);
+    S.drift.correct([x - (mean[0] + S.drift.beta[0]), y - (mean[1] + S.drift.beta[1])], performance.now() / 1000, pose);
+    S.far = { since: null, anchor: pose };
+    anchor.hidden = true;
+    got.forEach(({ f, now }) => S.log.push({ phase: 'tap', group, target: [x, y], ...sampleOf(f, now) }));
+    $('hint').textContent = `Corrected (${S.taps} tap${S.taps > 1 ? 's' : ''}).`;
   }, TIME.tap);
 });
 function ripple(x, y) {
@@ -381,7 +465,8 @@ function setView(view) {
 $('smooth').addEventListener('change', e => S.filter.set(...SMOOTHING[e.target.value]));
 $('btnClear').addEventListener('click', clearHeat);
 $('btnOk').addEventListener('click', () => { $('result').hidden = true; $('valmarks').innerHTML = ''; });
-$('btnRecal2').addEventListener('click', () => { $('result').hidden = true; $('valmarks').innerHTML = ''; setMode('setup'); });
+for (const id of ['btnSave', 'btnSave2']) $(id).addEventListener('click', saveData);
+$('btnRecal2').addEventListener('click', () => { $('result').hidden = true; $('valmarks').innerHTML = ''; toSetup(); });
 
 function layoutTrack() {
   $('track').style.setProperty('--toolbar-h', `${$('toolbar').offsetHeight}px`);
